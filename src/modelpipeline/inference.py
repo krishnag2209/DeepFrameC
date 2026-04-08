@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from config import Config
-from model import DeepFakeDetector
+from model import DualStreamDetector, DeepFakeDetector
 from transforms import get_transforms
 
 
@@ -192,13 +192,23 @@ def print_result(result: dict, video_path: str, threshold: float):
 
 # ── Model loader ───────────────────────────────────────────────────────────────
 
-def load_model(cfg: Config, checkpoint: str, device: torch.device) -> DeepFakeDetector:
-    model = DeepFakeDetector(
-        backbone_name=cfg.BACKBONE,
-        pretrained=False,       # weights come from checkpoint
-        dropout=cfg.DROPOUT,
-        num_classes=cfg.NUM_CLASSES,
-    ).to(device)
+def load_model(cfg: Config, checkpoint: str, device: torch.device) -> torch.nn.Module:
+    # Try DualStreamDetector first (new architecture), fall back to legacy
+    try:
+        model = DualStreamDetector(
+            pretrained  = False,
+            dropout     = cfg.DROPOUT,
+            num_classes = cfg.NUM_CLASSES,
+        ).to(device)
+        arch = "DualStreamDetector"
+    except Exception:
+        model = DeepFakeDetector(
+            backbone_name = cfg.BACKBONE,
+            pretrained    = False,
+            dropout       = cfg.DROPOUT,
+            num_classes   = cfg.NUM_CLASSES,
+        ).to(device)
+        arch = "DeepFakeDetector (legacy)"
 
     ckpt_path = Path(checkpoint)
     if not ckpt_path.exists():
@@ -208,6 +218,7 @@ def load_model(cfg: Config, checkpoint: str, device: torch.device) -> DeepFakeDe
     else:
         state = torch.load(ckpt_path, map_location=device, weights_only=True)
         model.load_state_dict(state)
+        print(f"  Architecture: {arch}")
         print(f"  Checkpoint: {ckpt_path}")
 
     model.eval()

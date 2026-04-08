@@ -63,9 +63,12 @@ class FFppFrameDataset(Dataset):
 
         frame = cv2.imread(str(img_path))
         if frame is None:
-            frame = np.zeros((224, 224, 3), dtype=np.uint8)
-        else:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Use neighbour frame instead of a silent zero-image (wrong size, confuses model)
+            alt = (idx + 1) % len(self.samples)
+            frame = cv2.imread(str(self.frames_dir / self.samples[alt][0]))
+            if frame is None:
+                frame = np.zeros((256, 256, 3), dtype=np.uint8)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         if self.transform:
             frame = self.transform(image=frame)["image"]
