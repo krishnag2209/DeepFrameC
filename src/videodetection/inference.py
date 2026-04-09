@@ -1,407 +1,238 @@
 """
-inference.py — Deepfake video inference using fine-tuned Swin-B checkpoint.
+Deepfake Video Detection - Inference Script
+Model: prithivMLmods/Deep-Fake-Detector-v2-Model (ViT-base, ~92% accuracy)
+Labels: "Realism" (real) | "Deepfake" (fake)
 
-Modes:
-    Single video  : python inference.py --video path/to/video.mp4
-    Directory     : python inference.py --video_dir path/to/videos/
-    Single image  : python inference.py --image path/to/face.jpg
-    CSV batch     : python inference.py --manifest path/to/manifest.csv
+Usage:
+    python inference.py --video path/to/video.mp4
+    python inference.py --video path/to/video.mp4 --frames 30 --device cuda
+    python inference.py --video path/to/video.mp4 --frames 50 --batch_size 16
 
-Output:
-    Per-video verdict (REAL / FAKE), fake probability, per-frame breakdown.
-    Optional --output results.json to persist results.
-
-Strategy:
-    - Extract cfg.FRAMES_PER_VIDEO evenly-spaced frames per video
-    - Detect + crop faces with MTCNN (centre-crop fallback)
-    - Run Swin-B forward pass on each frame
-    - Aggregate fake probabilities across frames via mean pooling
-    - Threshold at 0.5 for final verdict
-
-Install:
-    pip install torch torchvision transformers opencv-python-headless \
-                facenet-pytorch tqdm pandas
+Requirements:
+    pip install torch torchvision transformers opencv-python Pillow tqdm
 """
 
-import os
-import cv2
-import json
 import argparse
-import torch
-import torch.nn as nn
-import numpy as np
-import pandas as pd
+import sys
 from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
 from tqdm import tqdm
-from torchvision import transforms
-from transformers import SwinForImageClassification
-
-from config import Config
+from transformers import ViTForImageClassification, ViTImageProcessor
 
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Constants ────────────────────────────────────────────────────────────────
 
-HF_MODEL_ID    = "microsoft/swin-base-patch4-window7-224"
-IMAGENET_MEAN  = [0.485, 0.456, 0.406]
-IMAGENET_STD   = [0.229, 0.224, 0.225]
-LABEL_MAP      = {0: "REAL", 1: "FAKE"}
-
-
-# ── Model ─────────────────────────────────────────────────────────────────────
-
-class SwinDeepfakeDetector(nn.Module):
-    """
-    Must match the architecture defined in train.py exactly so that
-    state_dict keys align with the saved checkpoint.
-    """
-    def __init__(self, cfg: Config):
-        super().__init__()
-        self.backbone = SwinForImageClassification.from_pretrained(
-            HF_MODEL_ID,
-            num_labels              = cfg.NUM_CLASSES,
-            ignore_mismatched_sizes = True,
-        )
-        in_features = self.backbone.swin.num_features   # 1024 for Swin-B
-
-        self.backbone.classifier = nn.Sequential(
-            nn.BatchNorm1d(in_features),
-            nn.Dropout(p=cfg.DROPOUT),
-            nn.Linear(in_features, 512),
-            nn.GELU(),
-            nn.BatchNorm1d(512),
-            nn.Dropout(p=cfg.DROPOUT / 2),
-            nn.Linear(512, cfg.NUM_CLASSES),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(pixel_values=x).logits
+MODEL_ID = "prithivMLmods/Deep-Fake-Detector-v2-Model"
+DEFAULT_FRAMES = 32       # number of evenly-sampled frames to analyse
+DEFAULT_BATCH  = 8        # frames per forward pass
+DEEPFAKE_LABEL = "Deepfake"
+REAL_LABEL     = "Realism"
 
 
-def load_model(checkpoint_path: str, cfg: Config, device: torch.device) -> nn.Module:
-    model = SwinDeepfakeDetector(cfg).to(device)
+# ── Model loading ─────────────────────────────────────────────────────────────
 
-    ckpt = torch.load(checkpoint_path, map_location=device)
-
-    # Handle both raw state_dict saves and wrapped checkpoint dicts
-    state_dict = ckpt.get("model", ckpt)
-    model.load_state_dict(state_dict)
-
-    model.eval()
-    print(f"Loaded checkpoint: {checkpoint_path}")
-    return model
-
-
-# ── Preprocessing ─────────────────────────────────────────────────────────────
-
-def get_inference_transform(face_size: int) -> transforms.Compose:
-    return transforms.Compose([
-        transforms.ToPILImage(),
-        transforms.Resize((face_size, face_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
-
-
-def get_mtcnn(face_size: int, device: torch.device):
-    from facenet_pytorch import MTCNN
-    return MTCNN(
-        image_size   = face_size,
-        margin       = 40,
-        device       = device,
-        keep_all     = False,
-        post_process = False,
-    )
-
-
-def crop_face(frame_rgb: np.ndarray, mtcnn, face_size: int) -> np.ndarray:
-    """
-    Returns a (face_size, face_size, 3) uint8 RGB crop.
-    Attempts MTCNN detection; falls back to centre-crop on failure.
-    """
-    try:
-        face_tensor = mtcnn(frame_rgb)
-    except Exception:
-        face_tensor = None
-
-    if face_tensor is not None:
-        return face_tensor.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
-
-    # Centre-crop fallback
-    h, w   = frame_rgb.shape[:2]
-    s      = min(h, w)
-    y0, x0 = (h - s) // 2, (w - s) // 2
-    return cv2.resize(frame_rgb[y0:y0+s, x0:x0+s], (face_size, face_size))
+def load_model(device: torch.device):
+    print(f"[*] Loading model  : {MODEL_ID}")
+    processor = ViTImageProcessor.from_pretrained(MODEL_ID)
+    model     = ViTForImageClassification.from_pretrained(MODEL_ID)
+    model.to(device).eval()
+    print(f"[*] Device         : {device}")
+    return processor, model
 
 
 # ── Frame extraction ──────────────────────────────────────────────────────────
 
-def extract_frames(video_path: str, n_frames: int, mtcnn, face_size: int) -> list:
+def extract_frames(video_path: str, n_frames: int) -> list[Image.Image]:
     """
-    Returns list of (frame_index, np.ndarray[H,W,3] RGB) tuples.
-    Silently skips unreadable frames.
+    Uniformly sample `n_frames` frames from the video.
+    Returns a list of PIL RGB images.
     """
-    cap   = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        sys.exit(f"[!] Cannot open video: {video_path}")
+
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps   = cap.get(cv2.CAP_PROP_FPS)
+    dur   = total / fps if fps > 0 else 0.0
+
+    print(f"[*] Video          : {video_path}")
+    print(f"[*] Total frames   : {total}  |  FPS: {fps:.2f}  |  Duration: {dur:.2f}s")
 
     if total == 0:
-        cap.release()
-        return []
+        sys.exit("[!] Video has 0 frames.")
 
-    indices = np.linspace(0, total - 1, n_frames, dtype=int)
-    crops   = []
+    indices = np.linspace(0, total - 1, num=min(n_frames, total), dtype=int)
+    frames  = []
 
-    for idx in indices:
+    for idx in tqdm(indices, desc="Extracting frames", unit="frame"):
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
-        ret, frame = cap.read()
+        ret, bgr = cap.read()
         if not ret:
             continue
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        crop      = crop_face(frame_rgb, mtcnn, face_size)
-        crops.append((int(idx), crop))
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        frames.append(Image.fromarray(rgb))
 
     cap.release()
-    return crops
+    print(f"[*] Extracted      : {len(frames)} frames")
+    return frames
 
 
-# ── Inference core ────────────────────────────────────────────────────────────
+# ── Per-frame inference ───────────────────────────────────────────────────────
 
-@torch.inference_mode()
-def predict_frames(
-    frames: list,
-    model: nn.Module,
-    transform: transforms.Compose,
+def run_inference(
+    frames: list[Image.Image],
+    processor: ViTImageProcessor,
+    model: ViTForImageClassification,
     device: torch.device,
-    batch_size: int = 8,
-) -> list:
+    batch_size: int,
+) -> list[dict]:
     """
-    Args:
-        frames : list of (frame_index, np.ndarray RGB) from extract_frames
-    Returns:
-        list of {"frame_idx": int, "fake_prob": float, "pred": str}
+    Run batched inference.
+    Returns a list of per-frame dicts:
+        {"label": str, "deepfake_prob": float, "real_prob": float}
     """
+    id2label = model.config.id2label   # {0: "Deepfake", 1: "Realism"} (or vice-versa)
+
+    # Find the index corresponding to each label
+    deepfake_idx = next(k for k, v in id2label.items() if v == DEEPFAKE_LABEL)
+    real_idx     = next(k for k, v in id2label.items() if v == REAL_LABEL)
+
     results = []
 
-    for i in range(0, len(frames), batch_size):
-        batch_frames = frames[i : i + batch_size]
-        tensors      = torch.stack([transform(f) for _, f in batch_frames]).to(device)
+    for i in tqdm(range(0, len(frames), batch_size), desc="Running inference", unit="batch"):
+        batch_imgs = frames[i : i + batch_size]
+        inputs = processor(images=batch_imgs, return_tensors="pt").to(device)
 
-        with torch.amp.autocast(device.type):
-            logits = model(tensors)
+        with torch.no_grad():
+            logits = model(**inputs).logits          # (B, num_classes)
+            probs  = F.softmax(logits, dim=-1)       # (B, num_classes)
 
-        probs = torch.softmax(logits.float(), dim=1)[:, 1].cpu().numpy()
-
-        for (frame_idx, _), prob in zip(batch_frames, probs):
+        for j in range(probs.shape[0]):
+            p = probs[j].cpu().tolist()
+            deepfake_p = p[deepfake_idx]
+            real_p     = p[real_idx]
+            label      = DEEPFAKE_LABEL if deepfake_p > real_p else REAL_LABEL
             results.append({
-                "frame_idx" : frame_idx,
-                "fake_prob" : round(float(prob), 4),
-                "pred"      : LABEL_MAP[int(prob >= 0.5)],
+                "label":         label,
+                "deepfake_prob": deepfake_p,
+                "real_prob":     real_p,
             })
 
     return results
 
 
-def aggregate_verdict(frame_results: list, threshold: float = 0.5) -> dict:
-    """
-    Mean-pool fake probabilities across frames → final verdict.
-    Also returns frame-level majority vote for cross-checking.
-    """
-    if not frame_results:
-        return {"verdict": "UNKNOWN", "mean_fake_prob": None, "frame_fake_votes": 0,
-                "total_frames": 0}
+# ── Aggregation ───────────────────────────────────────────────────────────────
 
-    probs      = [r["fake_prob"] for r in frame_results]
-    mean_prob  = float(np.mean(probs))
-    fake_votes = sum(1 for r in frame_results if r["pred"] == "FAKE")
+def aggregate(per_frame: list[dict]) -> dict:
+    """
+    Aggregate per-frame results into a single video-level verdict.
+
+    Strategy:
+      - Mean pooling of deepfake probabilities across all frames.
+      - Verdict: "Deepfake" if mean deepfake_prob > 0.5, else "Realism".
+      - Confidence = max(mean_deepfake_prob, mean_real_prob) * 100.
+    """
+    deepfake_probs = [r["deepfake_prob"] for r in per_frame]
+    real_probs     = [r["real_prob"]     for r in per_frame]
+
+    mean_deepfake = float(np.mean(deepfake_probs))
+    mean_real     = float(np.mean(real_probs))
+
+    verdict    = DEEPFAKE_LABEL if mean_deepfake > mean_real else REAL_LABEL
+    confidence = max(mean_deepfake, mean_real) * 100.0
+
+    n_deepfake_frames = sum(1 for r in per_frame if r["label"] == DEEPFAKE_LABEL)
+    frame_ratio       = n_deepfake_frames / len(per_frame) * 100.0
 
     return {
-        "verdict"        : LABEL_MAP[int(mean_prob >= threshold)],
-        "mean_fake_prob" : round(mean_prob, 4),
-        "frame_fake_votes" : fake_votes,
-        "total_frames"   : len(frame_results),
+        "verdict":            verdict,
+        "confidence":         confidence,
+        "mean_deepfake_prob": mean_deepfake * 100.0,
+        "mean_real_prob":     mean_real     * 100.0,
+        "deepfake_frames":    n_deepfake_frames,
+        "total_frames":       len(per_frame),
+        "deepfake_frame_pct": frame_ratio,
     }
 
 
-# ── Per-input wrappers ────────────────────────────────────────────────────────
+# ── Reporting ─────────────────────────────────────────────────────────────────
 
-def run_video(
-    video_path: str,
-    model: nn.Module,
-    mtcnn,
-    transform: transforms.Compose,
-    device: torch.device,
-    cfg: Config,
-    verbose: bool = True,
-) -> dict:
-    frames = extract_frames(video_path, cfg.FRAMES_PER_VIDEO, mtcnn, cfg.FACE_SIZE)
+def print_report(agg: dict, per_frame: list[dict], verbose: bool):
+    bar   = "═" * 52
+    label = agg["verdict"]
+    conf  = agg["confidence"]
 
-    if not frames:
-        print(f"  [WARN] No frames extracted from {video_path}")
-        return {"file": video_path, "verdict": "UNKNOWN", "mean_fake_prob": None,
-                "frame_results": []}
-
-    frame_results = predict_frames(frames, model, transform, device, cfg.BATCH_SIZE)
-    verdict       = aggregate_verdict(frame_results)
-
-    result = {
-        "file"           : video_path,
-        "verdict"        : verdict["verdict"],
-        "mean_fake_prob" : verdict["mean_fake_prob"],
-        "frame_fake_votes" : verdict["frame_fake_votes"],
-        "total_frames"   : verdict["total_frames"],
-        "frame_results"  : frame_results,
-    }
+    print(f"\n{bar}")
+    print(f"  VERDICT    : {label.upper()}")
+    print(f"  CONFIDENCE : {conf:.2f}%")
+    print(f"{bar}")
+    print(f"  Mean deepfake probability : {agg['mean_deepfake_prob']:.2f}%")
+    print(f"  Mean real    probability  : {agg['mean_real_prob']:.2f}%")
+    print(f"  Deepfake frames           : {agg['deepfake_frames']} / {agg['total_frames']}"
+          f"  ({agg['deepfake_frame_pct']:.1f}%)")
+    print(f"{bar}\n")
 
     if verbose:
-        print(
-            f"  {Path(video_path).name:<40s} | "
-            f"{result['verdict']:4s} | "
-            f"prob={result['mean_fake_prob']:.4f} | "
-            f"fake_frames={result['frame_fake_votes']}/{result['total_frames']}"
-        )
+        print("Per-frame breakdown:")
+        print(f"  {'Frame':>6}  {'Label':<12}  {'Deepfake%':>10}  {'Real%':>8}")
+        print("  " + "-" * 44)
+        for i, r in enumerate(per_frame):
+            print(f"  {i+1:>6}  {r['label']:<12}  "
+                  f"{r['deepfake_prob']*100:>9.2f}%  {r['real_prob']*100:>7.2f}%")
+        print()
 
-    return result
 
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
-def run_image(
-    image_path: str,
-    model: nn.Module,
-    mtcnn,
-    transform: transforms.Compose,
-    device: torch.device,
-    cfg: Config,
-) -> dict:
-    img = cv2.imread(image_path)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
-
-    frame_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    crop      = crop_face(frame_rgb, mtcnn, cfg.FACE_SIZE)
-    results   = predict_frames([(0, crop)], model, transform, device, batch_size=1)
-    r         = results[0]
-
-    print(
-        f"  {Path(image_path).name:<40s} | "
-        f"{r['pred']:4s} | prob={r['fake_prob']:.4f}"
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Deepfake video detection using prithivMLmods/Deep-Fake-Detector-v2-Model"
     )
+    p.add_argument("--video",      required=True,             help="Path to input video file")
+    p.add_argument("--frames",     type=int, default=DEFAULT_FRAMES,
+                   help=f"Number of frames to sample (default: {DEFAULT_FRAMES})")
+    p.add_argument("--batch_size", type=int, default=DEFAULT_BATCH,
+                   help=f"Inference batch size (default: {DEFAULT_BATCH})")
+    p.add_argument("--device",     default="auto",
+                   choices=["auto", "cpu", "cuda", "mps"],
+                   help="Compute device (default: auto)")
+    p.add_argument("--verbose",    action="store_true",
+                   help="Print per-frame probabilities")
+    return p.parse_args()
 
-    return {"file": image_path, "verdict": r["pred"],
-            "mean_fake_prob": r["fake_prob"], "frame_results": results}
+
+def resolve_device(device_str: str) -> torch.device:
+    if device_str == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(device_str)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Deepfake detection inference")
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--video",      type=str, help="Path to a single video file")
-    src.add_argument("--video_dir",  type=str, help="Directory of video files (.mp4/.avi/.mov)")
-    src.add_argument("--image",      type=str, help="Path to a single face image")
-    src.add_argument("--manifest",   type=str, help="CSV with a 'path' column (images)")
-
-    p.add_argument("--checkpoint",   type=str, default="checkpoints/best.pth",
-                   help="Path to trained checkpoint (default: checkpoints/best.pth)")
-    p.add_argument("--threshold",    type=float, default=0.5,
-                   help="Fake probability threshold (default: 0.5)")
-    p.add_argument("--batch_size",   type=int,   default=8,
-                   help="Frame batch size for GPU inference (default: 8)")
-    p.add_argument("--output",       type=str,   default=None,
-                   help="Optional path to save results as JSON")
-    p.add_argument("--no_mtcnn",     action="store_true",
-                   help="Skip MTCNN; use centre-crop only (faster, less accurate)")
-    return p.parse_args()
-
-
 def main():
     args   = parse_args()
-    cfg    = Config()
-    cfg.BATCH_SIZE = args.batch_size   # allow CLI override
+    device = resolve_device(args.device)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device     : {device}")
-    print(f"Checkpoint : {args.checkpoint}")
-    print(f"Threshold  : {args.threshold}")
+    if not Path(args.video).is_file():
+        sys.exit(f"[!] File not found: {args.video}")
 
-    # ── Load model ────────────────────────────────────────────────────────────
-    if not Path(args.checkpoint).exists():
-        raise FileNotFoundError(
-            f"Checkpoint not found: {args.checkpoint}\n"
-            f"Train first with: python train.py"
-        )
-    model = load_model(args.checkpoint, cfg, device)
+    processor, model = load_model(device)
+    frames           = extract_frames(args.video, args.frames)
+    per_frame        = run_inference(frames, processor, model, device, args.batch_size)
+    agg              = aggregate(per_frame)
+    print_report(agg, per_frame, args.verbose)
 
-    # ── Load MTCNN ────────────────────────────────────────────────────────────
-    if args.no_mtcnn:
-        mtcnn = None
-        # Monkey-patch crop_face to always use centre-crop
-        global crop_face
-        _orig_crop = crop_face
-        def crop_face(frame_rgb, mtcnn, face_size):  # noqa: F811
-            h, w   = frame_rgb.shape[:2]
-            s      = min(h, w)
-            y0, x0 = (h - s) // 2, (w - s) // 2
-            return cv2.resize(frame_rgb[y0:y0+s, x0:x0+s], (face_size, face_size))
-    else:
-        mtcnn = get_mtcnn(cfg.FACE_SIZE, device)
-
-    transform = get_inference_transform(cfg.FACE_SIZE)
-    all_results = []
-
-    # ── Single video ──────────────────────────────────────────────────────────
-    if args.video:
-        print(f"\nInferring: {args.video}")
-        result = run_video(args.video, model, mtcnn, transform, device, cfg)
-        all_results.append(result)
-
-    # ── Video directory ───────────────────────────────────────────────────────
-    elif args.video_dir:
-        exts   = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-        videos = sorted(
-            p for p in Path(args.video_dir).iterdir()
-            if p.suffix.lower() in exts
-        )
-        if not videos:
-            raise FileNotFoundError(f"No video files found in {args.video_dir}")
-
-        print(f"\nInferring {len(videos)} videos from {args.video_dir}\n")
-        for vp in tqdm(videos, desc="Videos", unit="video"):
-            result = run_video(str(vp), model, mtcnn, transform, device, cfg, verbose=True)
-            all_results.append(result)
-
-        # Summary
-        verdicts  = [r["verdict"] for r in all_results if r["verdict"] != "UNKNOWN"]
-        n_fake    = verdicts.count("FAKE")
-        n_real    = verdicts.count("REAL")
-        print(f"\nSummary — REAL: {n_real} | FAKE: {n_fake} | UNKNOWN: "
-              f"{len(all_results) - len(verdicts)}")
-
-    # ── Single image ──────────────────────────────────────────────────────────
-    elif args.image:
-        print(f"\nInferring: {args.image}")
-        result = run_image(args.image, model, mtcnn, transform, device, cfg)
-        all_results.append(result)
-
-    # ── Manifest CSV (image paths) ────────────────────────────────────────────
-    elif args.manifest:
-        df = pd.read_csv(args.manifest)
-        if "path" not in df.columns:
-            raise ValueError("manifest CSV must contain a 'path' column")
-
-        print(f"\nInferring {len(df)} images from manifest: {args.manifest}\n")
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="Images", unit="img"):
-            try:
-                result = run_image(row["path"], model, mtcnn, transform, device, cfg)
-            except FileNotFoundError as e:
-                print(f"  [WARN] {e}")
-                result = {"file": row["path"], "verdict": "ERROR",
-                          "mean_fake_prob": None, "frame_results": []}
-            all_results.append(result)
-
-    # ── Persist results ───────────────────────────────────────────────────────
-    if args.output:
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.output, "w") as f:
-            json.dump(all_results, f, indent=2)
-        print(f"\nResults saved → {args.output}")
+    # Exit code: 1 if deepfake detected, 0 if real
+    sys.exit(1 if agg["verdict"] == DEEPFAKE_LABEL else 0)
 
 
 if __name__ == "__main__":
