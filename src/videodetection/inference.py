@@ -3,31 +3,32 @@ Deepfake Video Detection - Inference Script
 Model : prithivMLmods/Deep-Fake-Detector-v2-Model  (ViT-base, ~92% accuracy)
 Labels: "Realism" (real) | "Deepfake" (fake)
 
-ROOT CAUSE OF ALWAYS-DEEPFAKE BUG
-──────────────────────────────────
-The model was fine-tuned on tightly-cropped, face-centred images (224×224).
-Passing raw video frames (background + body + face) puts the input completely
-outside the training distribution → model defaults to Deepfake on everything.
-
 FIXES APPLIED
 ─────────────
-1. Face detection (OpenCV Haar cascade) → crop to face ROI before inference.
-2. Correct ViT normalisation: mean=[0.5,0.5,0.5]  std=[0.5,0.5,0.5]  (NOT ImageNet).
-3. Face crop margin: includes forehead/chin/ear boundary artefacts (key for deepfakes).
-4. Blur/quality gate: skips frames where the face crop is too blurry or small.
-5. Test-Time Augmentation (TTA): 5 mild photometric variants per face crop;
+1. Dynamic normalisation: reads actual mean/std from ViTImageProcessor instead
+   of hardcoding [0.5,0.5,0.5] — the #1 cause of the 50/50 confidence bug.
+2. MediaPipe face detector replaces unreliable Haar cascade; falls back to
+   Haar automatically if mediapipe is not installed.
+3. Uncertainty guard: flags results where mean deepfake prob is within 8 % of
+   0.5, i.e. the model genuinely cannot decide.
+4. Face crop margin: includes forehead/chin/ear boundary artefacts (key for deepfakes).
+5. Blur/quality gate: skips frames where the face crop is too blurry or small.
+6. Test-Time Augmentation (TTA): 5 mild photometric variants per face crop;
    softmax probabilities are averaged → reduces single-frame prediction noise.
-6. Temporal smoothing: median filter over the frame sequence before aggregation.
-7. Configurable decision threshold (default 0.50, tune with --threshold).
+7. Temporal smoothing: median filter over the frame sequence before aggregation.
+8. Configurable decision threshold (default 0.50, tune with --threshold).
 
 Usage:
     python inference.py --video path/to/video.mp4
-    python inference.py --video path/to/video.mp4 --frames 40 --device cuda --verbose
+    python inference.py --video path/to/video.mp4 --frames 80 --device cuda --verbose
     python inference.py --video path/to/video.mp4 --no_tta          # faster, less accurate
     python inference.py --video path/to/video.mp4 --threshold 0.55  # stricter deepfake gate
 
-Requirements:
+Requirements (core):
     pip install torch torchvision transformers opencv-python Pillow tqdm numpy
+
+Optional (better face detection):
+    pip install mediapipe
 """
 
 import argparse
@@ -42,6 +43,13 @@ from PIL import Image, ImageFilter, ImageEnhance
 from tqdm import tqdm
 from transformers import ViTForImageClassification, ViTImageProcessor
 
+# Optional mediapipe — detected at runtime
+try:
+    import mediapipe as mp
+    _MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    _MEDIAPIPE_AVAILABLE = False
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -49,32 +57,73 @@ MODEL_ID       = "prithivMLmods/Deep-Fake-Detector-v2-Model"
 DEEPFAKE_LABEL = "Deepfake"
 REAL_LABEL     = "Realism"
 
-# ViT-base-patch16-224 fine-tune normalisation  (NOT ImageNet means/stds)
-VIT_MEAN = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-VIT_STD  = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+# Populated dynamically from the processor after load_model() is called.
+# Do NOT hardcode these — wrong values are the #1 cause of 50/50 outputs.
+VIT_MEAN: np.ndarray = None  # type: ignore[assignment]
+VIT_STD:  np.ndarray = None  # type: ignore[assignment]
 
 # Face quality thresholds
 MIN_FACE_PX     = 60    # minimum face bounding-box side in pixels
 BLUR_THRESHOLD  = 80.0  # Laplacian variance; below = too blurry
 
-# OpenCV Haar cascade (bundled with opencv-python)
+# Uncertainty band: if |mean_deepfake_prob - 0.5| < this → warn user
+UNCERTAINTY_BAND = 0.08
+
+# OpenCV Haar cascade (fallback when mediapipe is unavailable)
 CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
 def load_model(device: torch.device):
+    """Load model and processor; extract real normalisation stats from processor."""
+    global VIT_MEAN, VIT_STD
+
     print(f"[*] Loading model  : {MODEL_ID}")
-    # We keep the processor only to read its config; actual pixel normalisation
-    # is done manually so we can apply TTA before tensor conversion.
     processor = ViTImageProcessor.from_pretrained(MODEL_ID)
     model     = ViTForImageClassification.from_pretrained(MODEL_ID)
     model.to(device).eval()
+
+    # ── FIX 1: use the processor's actual mean/std, not hardcoded [0.5,0.5,0.5] ──
+    VIT_MEAN = np.array(processor.image_mean, dtype=np.float32)
+    VIT_STD  = np.array(processor.image_std,  dtype=np.float32)
+    print(f"[*] Normalisation  : mean={VIT_MEAN.tolist()}  std={VIT_STD.tolist()}")
     print(f"[*] Device         : {device}")
+    print(f"[*] Face detector  : {'MediaPipe' if _MEDIAPIPE_AVAILABLE else 'Haar cascade (install mediapipe for better accuracy)'}")
     return processor, model
 
 
-# ── Face detection ────────────────────────────────────────────────────────────
+# ── Face detection — MediaPipe (primary) ──────────────────────────────────────
+
+def detect_faces_mediapipe(bgr: np.ndarray) -> list[tuple]:
+    """
+    Detect faces with MediaPipe Face Detection (much more reliable than Haar).
+    Returns list of (x, y, w, h) bounding boxes sorted largest-first.
+    """
+    mp_face = mp.solutions.face_detection
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    H, W = bgr.shape[:2]
+
+    with mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.60) as det:
+        result = det.process(rgb)
+
+    if not result.detections:
+        return []
+
+    boxes = []
+    for detection in result.detections:
+        bb = detection.location_data.relative_bounding_box
+        x = max(0, int(bb.xmin * W))
+        y = max(0, int(bb.ymin * H))
+        w = int(bb.width  * W)
+        h = int(bb.height * H)
+        if w >= MIN_FACE_PX and h >= MIN_FACE_PX:
+            boxes.append((x, y, w, h))
+
+    return sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+
+
+# ── Face detection — Haar cascade (fallback) ──────────────────────────────────
 
 _cascade = None
 
@@ -87,10 +136,10 @@ def get_cascade():
     return _cascade
 
 
-def detect_faces(bgr: np.ndarray) -> list[tuple]:
+def detect_faces_haar(bgr: np.ndarray) -> list[tuple]:
     """Return bounding boxes (x,y,w,h), sorted largest-first."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)  # normalise contrast → better detection
+    gray = cv2.equalizeHist(gray)
     cascade = get_cascade()
     faces = cascade.detectMultiScale(
         gray,
@@ -101,8 +150,17 @@ def detect_faces(bgr: np.ndarray) -> list[tuple]:
     )
     if len(faces) == 0:
         return []
-    return sorted([tuple(f) for f in faces], key=lambda b: b[2]*b[3], reverse=True)
+    return sorted([tuple(f) for f in faces], key=lambda b: b[2] * b[3], reverse=True)
 
+
+def detect_faces(bgr: np.ndarray) -> list[tuple]:
+    """Dispatch to MediaPipe if available, otherwise Haar."""
+    if _MEDIAPIPE_AVAILABLE:
+        return detect_faces_mediapipe(bgr)
+    return detect_faces_haar(bgr)
+
+
+# ── Face crop & quality gate ──────────────────────────────────────────────────
 
 def crop_face(bgr: np.ndarray, bbox: tuple, margin: float = 0.30) -> np.ndarray | None:
     """
@@ -130,7 +188,7 @@ def is_blurry(bgr_crop: np.ndarray) -> bool:
 def preprocess(pil_img: Image.Image) -> np.ndarray:
     """
     Resize to 224×224 (bicubic, matching ViTImageProcessor default) and
-    normalise with ViT mean/std to produce a float32 array in [-1, 1].
+    normalise with the processor's actual mean/std read at load time.
     """
     img = pil_img.resize((224, 224), Image.BICUBIC)
     arr = np.array(img, dtype=np.float32) / 255.0
@@ -157,8 +215,8 @@ def build_tta_variants(pil_rgb: Image.Image) -> list[np.ndarray]:
 
 def arrays_to_tensor(arrays: list[np.ndarray], device: torch.device) -> torch.Tensor:
     """Stack HWC float32 arrays → NCHW tensor on device."""
-    stacked = np.stack(arrays, axis=0)                  # (N, 224, 224, 3)
-    tensor  = torch.from_numpy(stacked).permute(0, 3, 1, 2)  # (N, 3, 224, 224)
+    stacked = np.stack(arrays, axis=0)                       # (N, 224, 224, 3)
+    tensor  = torch.from_numpy(stacked).permute(0, 3, 1, 2) # (N, 3, 224, 224)
     return tensor.to(device)
 
 
@@ -239,7 +297,7 @@ def run_inference(
         rp = probs[real_idx].item()
 
         results.append({
-            "frame_idx":    frame_idx,
+            "frame_idx":     frame_idx,
             "deepfake_prob": dp,
             "real_prob":     rp,
             "label":         DEEPFAKE_LABEL if dp > rp else REAL_LABEL,
@@ -262,7 +320,7 @@ def temporal_smooth(per_frame: list[dict], window: int = 5) -> list[dict]:
     probs    = np.array([r["deepfake_prob"] for r in per_frame])
     pad      = window // 2
     padded   = np.pad(probs, pad, mode="edge")
-    smoothed = np.array([np.median(padded[i:i+window]) for i in range(len(probs))])
+    smoothed = np.array([np.median(padded[i:i + window]) for i in range(len(probs))])
 
     out = []
     for i, r in enumerate(per_frame):
@@ -287,6 +345,9 @@ def aggregate(per_frame: list[dict], threshold: float) -> dict:
     confidence = max(md, mr) * 100.0
     n_fake     = sum(1 for r in per_frame if r["label"] == DEEPFAKE_LABEL)
 
+    # ── FIX 3: flag low-confidence / uncertain results ──────────────────────
+    is_uncertain = abs(md - 0.5) < UNCERTAINTY_BAND
+
     return {
         "verdict":            verdict,
         "confidence":         confidence,
@@ -296,6 +357,7 @@ def aggregate(per_frame: list[dict], threshold: float) -> dict:
         "total_frames":       len(per_frame),
         "deepfake_frame_pct": n_fake / len(per_frame) * 100.0,
         "threshold_used":     threshold * 100.0,
+        "uncertain":          is_uncertain,
     }
 
 
@@ -307,7 +369,20 @@ def print_report(agg: dict, per_frame: list[dict], verbose: bool):
     print(f"  VERDICT    : {agg['verdict'].upper()}")
     print(f"  CONFIDENCE : {agg['confidence']:.2f}%")
     print(f"  THRESHOLD  : {agg['threshold_used']:.1f}%")
-    print(f"{bar}")
+
+    # ── FIX 3: uncertainty warning ──────────────────────────────────────────
+    if agg["uncertain"]:
+        print(f"\n  ⚠  LOW CONFIDENCE — result may be unreliable.")
+        print(f"     Mean deepfake prob ({agg['mean_deepfake_prob']:.1f}%) is within")
+        print(f"     {UNCERTAINTY_BAND*100:.0f}% of 50 % — the model is uncertain.")
+        print(f"     Suggestions:")
+        print(f"       • Use a higher-quality / higher-resolution video")
+        print(f"       • Increase --frames (e.g. --frames 80)")
+        print(f"       • Ensure the video contains clearly visible frontal faces")
+        if not _MEDIAPIPE_AVAILABLE:
+            print(f"       • pip install mediapipe  (better face detection)")
+
+    print(f"\n{bar}")
     print(f"  Mean deepfake prob : {agg['mean_deepfake_prob']:.2f}%")
     print(f"  Mean real    prob  : {agg['mean_real_prob']:.2f}%")
     print(f"  Deepfake frames    : {agg['deepfake_frames']} / {agg['total_frames']}"
@@ -335,7 +410,7 @@ def parse_args():
     p.add_argument("--frames",     type=int, default=40,
                    help="Frames to uniformly sample (default: 40)")
     p.add_argument("--device",     default="auto",
-                   choices=["auto","cpu","cuda","mps"],
+                   choices=["auto", "cpu", "cuda", "mps"],
                    help="Compute device (default: auto)")
     p.add_argument("--threshold",  type=float, default=0.50,
                    help="Deepfake decision threshold 0-1 (default: 0.50)")
@@ -350,7 +425,7 @@ def parse_args():
 
 def resolve_device(s: str) -> torch.device:
     if s == "auto":
-        if torch.cuda.is_available():        return torch.device("cuda")
+        if torch.cuda.is_available():         return torch.device("cuda")
         if torch.backends.mps.is_available(): return torch.device("mps")
         return torch.device("cpu")
     return torch.device(s)
@@ -379,6 +454,8 @@ def main():
         print("    - Increase --frames (e.g. --frames 80)")
         print("    - Reduce --margin (e.g. --margin 0.10) to accept smaller crops")
         print("    - Ensure the video contains frontal human faces")
+        if not _MEDIAPIPE_AVAILABLE:
+            print("    - pip install mediapipe  (much better face detection)")
         sys.exit(2)
 
     per_frame = temporal_smooth(per_frame, window=5)
