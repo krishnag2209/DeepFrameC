@@ -6,23 +6,19 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import Config
 
-
 def sample_indices(total_frames: int, n: int) -> list:
     if total_frames <= n:
         return list(range(total_frames))
     return np.linspace(0, total_frames - 1, n, dtype=int).tolist()
 
-
 def process_video(args):
     """
-    Decode n frames from a video, save as JPEG under:
-        <output_root>/<relative_video_dir>/<video_stem>/frame_0000.jpg ...
-    Returns list of (relative_frame_path, label) or empty on failure.
+    Extracts and resizes frames for ViT (224x224).
     """
     vid_path, label, data_root, output_root, frames_per_video, face_size = args
 
-    rel_path     = Path(vid_path).relative_to(data_root)   # e.g. Deepfakes/000_003.mp4
-    frame_dir    = Path(output_root) / rel_path.parent / rel_path.stem
+    rel_path = Path(vid_path).relative_to(data_root)
+    frame_dir = Path(output_root) / rel_path.parent / rel_path.stem
     frame_dir.mkdir(parents=True, exist_ok=True)
 
     cap = cv2.VideoCapture(str(vid_path))
@@ -37,7 +33,7 @@ def process_video(args):
     for i, idx in enumerate(indices):
         out_path = frame_dir / f"frame_{i:04d}.jpg"
 
-        if out_path.exists():               # resumable — skip already done
+        if out_path.exists():
             rel_frame = out_path.relative_to(output_root)
             results.append((str(rel_frame), label))
             continue
@@ -47,14 +43,16 @@ def process_video(args):
         if not ret or frame is None:
             continue
 
+        # Convert to RGB for consistency with Transformer training
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # Resize to model's native input size (cfg.FACE_SIZE, e.g. 380 for EfficientNet-B4).
-        # If you previously ran this with FACE_SIZE=22, delete FRAMES_DIR and re-run.
-        frame = cv2.resize(frame, (face_size, face_size), interpolation=cv2.INTER_AREA)
 
-        # Save as high-quality JPEG
-        save_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) # Keep the format same
-        cv2.imwrite(str(out_path), save_frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        # ViT Requirement: Resize to 224x224
+        # INTER_CUBIC is used for better detail retention in high-frequency areas
+        frame = cv2.resize(frame, (face_size, face_size), interpolation=cv2.INTER_CUBIC)
+
+        # Save as high-quality BGR for OpenCV imwrite
+        save_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(out_path), save_frame, [cv2.IMWRITE_JPEG_QUALITY, 98])
 
         rel_frame = out_path.relative_to(output_root)
         results.append((str(rel_frame), label))
@@ -62,14 +60,18 @@ def process_video(args):
     cap.release()
     return results
 
-
 def preprocess_dataset(cfg):
     output_root = Path(cfg.FRAMES_DIR)
     output_root.mkdir(parents=True, exist_ok=True)
 
     manifest_path = output_root / "manifest.csv"
 
+    # Ensure metadata path is correct relative to DATA_ROOT
     meta_path = Path(cfg.DATA_ROOT) / "csv" / "FF++_Metadata.csv"
+    if not meta_path.exists():
+        print(f"[!] Metadata not found at {meta_path}")
+        return
+
     df = pd.read_csv(meta_path, index_col=0)[["File Path", "Label"]].dropna()
 
     allowed_prefixes = tuple(["original"] + cfg.MANIPULATION_TYPES)
@@ -88,7 +90,8 @@ def preprocess_dataset(cfg):
                 cfg.FACE_SIZE,
             ))
 
-    print(f"Videos to process: {len(tasks)}")
+    print(f"[*] Videos found: {len(tasks)}")
+    print(f"[*] Target Size: {cfg.FACE_SIZE}x{cfg.FACE_SIZE}")
 
     all_records = []
     failed = 0
@@ -96,7 +99,7 @@ def preprocess_dataset(cfg):
     with ThreadPoolExecutor(max_workers=cfg.NUM_WORKERS) as executor:
         futures = {executor.submit(process_video, t): t for t in tasks}
         bar = tqdm(as_completed(futures), total=len(futures),
-                   desc="Extracting frames", unit="video")
+                   desc="Processing for ViT", unit="video")
         for future in bar:
             try:
                 records = future.result()
@@ -108,10 +111,9 @@ def preprocess_dataset(cfg):
     manifest = pd.DataFrame(all_records, columns=["Frame Path", "Label"])
     manifest.to_csv(manifest_path, index=False)
 
-    print(f"\nDone. {len(manifest)} frames saved → {manifest_path}")
-    print(f"Failed videos: {failed}")
-    return manifest_path
-
+    print(f"\n[*] Complete. {len(manifest)} frames saved to {manifest_path}")
+    if failed:
+        print(f"[!] Failed videos: {failed}")
 
 if __name__ == "__main__":
     cfg = Config()

@@ -7,34 +7,41 @@ class DeepFakeDetector(nn.Module):
     Backbone: EfficientNet-B4 or Xception via timm.
     Head: dropout → linear → 2-class logits.
     """
-    def __init__(self, backbone_name="efficientnet_b4", pretrained=True,
-                 dropout=0.5, num_classes=2):
+    def __init__(self, backbone_name="tf_efficientv2_1", pretrained=True,
+                 dropout=0.2, num_classes=2):
         super().__init__()
 
         self.backbone = timm.create_model(
             backbone_name,
             pretrained=pretrained,
             num_classes=0,       # remove classifier head
-            global_pool="avg",
         )
-        in_features = self.backbone.num_features
+        num_features = self.backbone.num_features
+        print(num_features)
 
         self.classifier = nn.Sequential(
-            nn.Dropout(p=dropout),
-            nn.Linear(in_features, 512),
+            nn.AdaptiveAvgPool2d((1,1)),
+            nn.Flatten(),
+            nn.Linear(num_features, 512),
             nn.SiLU(),
-            nn.Dropout(p=dropout / 2),
+            nn.BatchNorm1d(512),
             nn.Linear(512, num_classes),
         )
+        self.freeze_layers()
+
+    def freeze_layers(self):
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        for param in list(self.backbone.parameters())[-30:]:
+            param.requires_grad = True
+            
 
     def forward(self, x):
-        features = self.backbone(x)          # (B, in_features)
+        features = self.backbone.forward_features(x)          # (B, in_features)
         logits   = self.classifier(features) # (B, num_classes)
+        if logits.dim() == 2 and logits.size(1) == 1:
+            logits = logits.squeeze(1)
         return logits
-
-    def get_feature_maps(self, x):
-        """For GradCAM visualization."""
-        return self.backbone.forward_features(x)
 
 class XceptionDetector(nn.Module):
     """
