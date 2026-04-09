@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.pth
+*.pt
+temp/
+.env
+.env.*
+node_modules/
+frontend/node_modules/
+# Keep the built dist so Railway can serve it without re-building if needed
+# frontend/dist/
+.DS_Store
+*.egg-info/
+dist/
+build/
