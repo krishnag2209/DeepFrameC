@@ -1,0 +1,29 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# Web framework
+fastapi>=0.100.0
+uvicorn>=0.22.0
+python-multipart>=0.0.6
+jinja2>=3.1.2
+
+# Telegram bot (optional — skipped if TELEGRAM_TOKEN not set)
+python-telegram-bot>=20.3
+aiohttp>=3.8.4
+python-dotenv>=1.0.0
+
+# Computer vision
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+Pillow>=10.0.0
+tqdm>=4.65.0
+
+# PyTorch (CPU build for Railway)
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+
+# Local EfficientNetV2 model dependencies
+timm>=0.9.0
+huggingface-hub>=0.19.0
+
+# Optional: better face detection (significantly improves accuracy)
+# mediapipe>=0.10.0
