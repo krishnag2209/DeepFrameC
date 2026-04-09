@@ -44,11 +44,21 @@ from tqdm import tqdm
 from transformers import ViTForImageClassification, ViTImageProcessor
 
 # Optional mediapipe — detected at runtime
+# Supports both new Tasks API (v0.10+) and legacy solutions API (v0.9.x)
 try:
     import mediapipe as mp
+    try:
+        # New Tasks API (mediapipe >= 0.10)
+        from mediapipe.tasks import python as mp_python
+        from mediapipe.tasks.python import vision as mp_vision
+        _MP_USE_TASKS = True
+    except ImportError:
+        # Legacy solutions API (mediapipe 0.9.x)
+        _MP_USE_TASKS = False
     _MEDIAPIPE_AVAILABLE = True
 except ImportError:
     _MEDIAPIPE_AVAILABLE = False
+    _MP_USE_TASKS = False
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -95,23 +105,10 @@ def load_model(device: torch.device):
 
 # ── Face detection — MediaPipe (primary) ──────────────────────────────────────
 
-def detect_faces_mediapipe(bgr: np.ndarray) -> list[tuple]:
-    """
-    Detect faces with MediaPipe Face Detection (much more reliable than Haar).
-    Returns list of (x, y, w, h) bounding boxes sorted largest-first.
-    """
-    mp_face = mp.solutions.face_detection
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    H, W = bgr.shape[:2]
-
-    with mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.60) as det:
-        result = det.process(rgb)
-
-    if not result.detections:
-        return []
-
+def _boxes_from_detections(detections, H: int, W: int) -> list[tuple]:
+    """Parse relative bounding boxes from MediaPipe detections (shared by both APIs)."""
     boxes = []
-    for detection in result.detections:
+    for detection in detections:
         bb = detection.location_data.relative_bounding_box
         x = max(0, int(bb.xmin * W))
         y = max(0, int(bb.ymin * H))
@@ -119,8 +116,50 @@ def detect_faces_mediapipe(bgr: np.ndarray) -> list[tuple]:
         h = int(bb.height * H)
         if w >= MIN_FACE_PX and h >= MIN_FACE_PX:
             boxes.append((x, y, w, h))
-
     return sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+
+
+def detect_faces_mediapipe(bgr: np.ndarray) -> list[tuple]:
+    """
+    Detect faces with MediaPipe (much more reliable than Haar).
+    Automatically uses the new Tasks API (v0.10+) or falls back to the
+    legacy solutions API (v0.9.x) depending on what is installed.
+    Returns list of (x, y, w, h) bounding boxes sorted largest-first.
+    """
+    H, W = bgr.shape[:2]
+    rgb  = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    if _MP_USE_TASKS:
+        # ── New Tasks API (mediapipe >= 0.10) ──────────────────────────────
+        import urllib.request, tempfile, os
+        model_url  = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+        model_path = os.path.join(tempfile.gettempdir(), "blaze_face_short_range.tflite")
+        if not os.path.exists(model_path):
+            urllib.request.urlretrieve(model_url, model_path)
+
+        base_opts    = mp_python.BaseOptions(model_asset_path=model_path)
+        det_opts     = mp_vision.FaceDetectorOptions(
+            base_options=base_opts,
+            min_detection_confidence=0.60,
+        )
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        with mp_vision.FaceDetector.create_from_options(det_opts) as detector:
+            result = detector.detect(mp_image)
+
+        if not result.detections:
+            return []
+        return _boxes_from_detections(result.detections, H, W)
+
+    else:
+        # ── Legacy solutions API (mediapipe 0.9.x) ─────────────────────────
+        with mp.solutions.face_detection.FaceDetection(
+            model_selection=1, min_detection_confidence=0.60
+        ) as det:
+            result = det.process(rgb)
+
+        if not result.detections:
+            return []
+        return _boxes_from_detections(result.detections, H, W)
 
 
 # ── Face detection — Haar cascade (fallback) ──────────────────────────────────
